@@ -1,0 +1,276 @@
+# COMMAND ----------
+# Module 3: Rolling 14-Month Window Merchant Presence Analysis
+
+print("Analyzing merchant presence using rolling 14-month windows...")
+
+# Create rolling 14-month window analysis
+rolling_merchant_presence = spark.sql("""
+WITH monthly_data AS (
+    SELECT DISTINCT txn_year_month
+    FROM all_merchants
+    ORDER BY txn_year_month
+),
+rolling_windows AS (
+    SELECT 
+        txn_year_month as current_month,
+        -- Calculate 14-month window ending in current month
+        ADD_MONTHS(txn_year_month, -13) as window_start,
+        txn_year_month as window_end
+    FROM monthly_data
+),
+merchant_window_presence AS (
+    SELECT 
+        rw.current_month,
+        rw.window_start,
+        rw.window_end,
+        am.merchant_key,
+        am.naics3,
+        COUNT(DISTINCT am.txn_year_month) as months_present_in_window,
+        SUM(am.adjusted_sales) as total_sales_in_window,
+        SUM(am.adjusted_txn_cnt) as total_txn_in_window
+    FROM rolling_windows rw
+    CROSS JOIN (SELECT DISTINCT merchant_key, naics3 FROM all_merchants) merchants
+    LEFT JOIN all_merchants am ON merchants.merchant_key = am.merchant_key 
+                               AND merchants.naics3 = am.naics3
+                               AND am.txn_year_month BETWEEN rw.window_start AND rw.window_end
+    GROUP BY rw.current_month, rw.window_start, rw.window_end, am.merchant_key, am.naics3
+)
+SELECT 
+    current_month,
+    window_start,
+    window_end,
+    naics3,
+    merchant_key,
+    COALESCE(months_present_in_window, 0) as months_present_in_window,
+    COALESCE(total_sales_in_window, 0) as total_sales_in_window,
+    COALESCE(total_txn_in_window, 0) as total_txn_in_window,
+    CASE 
+        WHEN COALESCE(months_present_in_window, 0) = 0 THEN 'months_0'
+        WHEN COALESCE(months_present_in_window, 0) BETWEEN 1 AND 4 THEN 'months_1_4'
+        WHEN COALESCE(months_present_in_window, 0) BETWEEN 5 AND 8 THEN 'months_5_8'
+        WHEN COALESCE(months_present_in_window, 0) BETWEEN 9 AND 12 THEN 'months_9_12'
+        WHEN COALESCE(months_present_in_window, 0) = 13 THEN 'months_13'
+        WHEN COALESCE(months_present_in_window, 0) >= 14 THEN 'months_14_plus'
+    END as presence_bucket
+FROM merchant_window_presence
+ORDER BY current_month, naics3, merchant_key
+""")
+
+rolling_merchant_presence.createOrReplaceTempView("rolling_merchant_presence")
+
+print("Rolling merchant presence analysis created")
+print("Sample of rolling windows:")
+rolling_merchant_presence.select("current_month", "window_start", "window_end", "naics3", "months_present_in_window", "presence_bucket").show(10)
+
+# COMMAND ----------
+# Create aggregated rolling window analysis by month and NAICS
+
+rolling_presence_distribution = spark.sql("""
+SELECT 
+    current_month,
+    naics3,
+    SUM(CASE WHEN presence_bucket = 'months_0' THEN 1 ELSE 0 END) AS months_0,
+    SUM(CASE WHEN presence_bucket = 'months_1_4' THEN 1 ELSE 0 END) AS months_1_4,
+    SUM(CASE WHEN presence_bucket = 'months_5_8' THEN 1 ELSE 0 END) AS months_5_8,
+    SUM(CASE WHEN presence_bucket = 'months_9_12' THEN 1 ELSE 0 END) AS months_9_12,
+    SUM(CASE WHEN presence_bucket = 'months_13' THEN 1 ELSE 0 END) AS months_13,
+    SUM(CASE WHEN presence_bucket = 'months_14_plus' THEN 1 ELSE 0 END) AS months_14_plus,
+    COUNT(*) AS total_merchants
+FROM rolling_merchant_presence
+GROUP BY current_month, naics3
+ORDER BY current_month, naics3
+""")
+
+rolling_presence_distribution.createOrReplaceTempView("rolling_presence_distribution")
+
+print("\nRolling presence distribution by month and NAICS:")
+rolling_presence_distribution.show(20)
+
+# COMMAND ----------
+# Create sales distribution for rolling windows
+
+rolling_sales_distribution = spark.sql("""
+SELECT 
+    current_month,
+    naics3,
+    SUM(CASE WHEN presence_bucket = 'months_0' THEN total_sales_in_window ELSE 0 END) AS sales_months_0,
+    SUM(CASE WHEN presence_bucket = 'months_1_4' THEN total_sales_in_window ELSE 0 END) AS sales_months_1_4,
+    SUM(CASE WHEN presence_bucket = 'months_5_8' THEN total_sales_in_window ELSE 0 END) AS sales_months_5_8,
+    SUM(CASE WHEN presence_bucket = 'months_9_12' THEN total_sales_in_window ELSE 0 END) AS sales_months_9_12,
+    SUM(CASE WHEN presence_bucket = 'months_13' THEN total_sales_in_window ELSE 0 END) AS sales_months_13,
+    SUM(CASE WHEN presence_bucket = 'months_14_plus' THEN total_sales_in_window ELSE 0 END) AS sales_months_14_plus,
+    SUM(total_sales_in_window) AS total_sales_all
+FROM rolling_merchant_presence
+GROUP BY current_month, naics3
+ORDER BY current_month, naics3
+""")
+
+rolling_sales_distribution.createOrReplaceTempView("rolling_sales_distribution")
+
+# Add percentage columns for rolling sales
+rolling_sales_with_pct = spark.sql("""
+SELECT 
+    current_month,
+    naics3,
+    sales_months_0,
+    sales_months_1_4,
+    sales_months_5_8,
+    sales_months_9_12,
+    sales_months_13,
+    sales_months_14_plus,
+    total_sales_all,
+    CASE WHEN total_sales_all > 0 THEN ROUND(sales_months_0 / total_sales_all * 100, 1) ELSE 0 END AS pct_sales_months_0,
+    CASE WHEN total_sales_all > 0 THEN ROUND(sales_months_1_4 / total_sales_all * 100, 1) ELSE 0 END AS pct_sales_months_1_4,
+    CASE WHEN total_sales_all > 0 THEN ROUND(sales_months_5_8 / total_sales_all * 100, 1) ELSE 0 END AS pct_sales_months_5_8,
+    CASE WHEN total_sales_all > 0 THEN ROUND(sales_months_9_12 / total_sales_all * 100, 1) ELSE 0 END AS pct_sales_months_9_12,
+    CASE WHEN total_sales_all > 0 THEN ROUND(sales_months_13 / total_sales_all * 100, 1) ELSE 0 END AS pct_sales_months_13,
+    CASE WHEN total_sales_all > 0 THEN ROUND(sales_months_14_plus / total_sales_all * 100, 1) ELSE 0 END AS pct_sales_months_14_plus
+FROM rolling_sales_distribution
+WHERE total_sales_all > 0
+ORDER BY current_month, naics3
+""")
+
+rolling_sales_with_pct.createOrReplaceTempView("rolling_sales_with_pct")
+
+print("\nRolling sales distribution with percentages:")
+rolling_sales_with_pct.show(15)
+
+# COMMAND ----------
+# Create transaction distribution for rolling windows
+
+rolling_txn_distribution = spark.sql("""
+SELECT 
+    current_month,
+    naics3,
+    SUM(CASE WHEN presence_bucket = 'months_0' THEN total_txn_in_window ELSE 0 END) AS txn_months_0,
+    SUM(CASE WHEN presence_bucket = 'months_1_4' THEN total_txn_in_window ELSE 0 END) AS txn_months_1_4,
+    SUM(CASE WHEN presence_bucket = 'months_5_8' THEN total_txn_in_window ELSE 0 END) AS txn_months_5_8,
+    SUM(CASE WHEN presence_bucket = 'months_9_12' THEN total_txn_in_window ELSE 0 END) AS txn_months_9_12,
+    SUM(CASE WHEN presence_bucket = 'months_13' THEN total_txn_in_window ELSE 0 END) AS txn_months_13,
+    SUM(CASE WHEN presence_bucket = 'months_14_plus' THEN total_txn_in_window ELSE 0 END) AS txn_months_14_plus,
+    SUM(total_txn_in_window) AS total_txn_all
+FROM rolling_merchant_presence
+GROUP BY current_month, naics3
+ORDER BY current_month, naics3
+""")
+
+rolling_txn_distribution.createOrReplaceTempView("rolling_txn_distribution")
+
+# Add percentage columns for rolling transactions
+rolling_txn_with_pct = spark.sql("""
+SELECT 
+    current_month,
+    naics3,
+    txn_months_0,
+    txn_months_1_4,
+    txn_months_5_8,
+    txn_months_9_12,
+    txn_months_13,
+    txn_months_14_plus,
+    total_txn_all,
+    CASE WHEN total_txn_all > 0 THEN ROUND(txn_months_0 / total_txn_all * 100, 1) ELSE 0 END AS pct_txn_months_0,
+    CASE WHEN total_txn_all > 0 THEN ROUND(txn_months_1_4 / total_txn_all * 100, 1) ELSE 0 END AS pct_txn_months_1_4,
+    CASE WHEN total_txn_all > 0 THEN ROUND(txn_months_5_8 / total_txn_all * 100, 1) ELSE 0 END AS pct_txn_months_5_8,
+    CASE WHEN total_txn_all > 0 THEN ROUND(txn_months_9_12 / total_txn_all * 100, 1) ELSE 0 END AS pct_txn_months_9_12,
+    CASE WHEN total_txn_all > 0 THEN ROUND(txn_months_13 / total_txn_all * 100, 1) ELSE 0 END AS pct_txn_months_13,
+    CASE WHEN total_txn_all > 0 THEN ROUND(txn_months_14_plus / total_txn_all * 100, 1) ELSE 0 END AS pct_txn_months_14_plus
+FROM rolling_txn_distribution
+WHERE total_txn_all > 0
+ORDER BY current_month, naics3
+""")
+
+rolling_txn_with_pct.createOrReplaceTempView("rolling_txn_with_pct")
+
+print("\nRolling transaction distribution with percentages:")
+rolling_txn_with_pct.show(15)
+
+# COMMAND ----------
+# Create simplified rolling comparison (≤13 vs ≥14 months)
+
+rolling_simplified_comparison = spark.sql("""
+SELECT 
+    current_month,
+    naics3,
+    (months_0 + months_1_4 + months_5_8 + months_9_12 + months_13) AS merchants_13_or_less,
+    months_14_plus AS merchants_14_plus,
+    total_merchants,
+    CASE WHEN total_merchants > 0 
+         THEN ROUND((months_0 + months_1_4 + months_5_8 + months_9_12 + months_13) / total_merchants * 100, 1) 
+         ELSE 0 
+    END AS pct_merchants_13_or_less,
+    CASE WHEN total_merchants > 0 
+         THEN ROUND(months_14_plus / total_merchants * 100, 1) 
+         ELSE 0 
+    END AS pct_merchants_14_plus
+FROM rolling_presence_distribution
+WHERE total_merchants > 50
+ORDER BY current_month, total_merchants DESC
+""")
+
+rolling_simplified_comparison.createOrReplaceTempView("rolling_simplified_comparison")
+
+print("\nRolling simplified comparison (≤13 vs ≥14 months):")
+rolling_simplified_comparison.show(20)
+
+# COMMAND ----------
+# Create dashboard-ready rolling window views
+
+print("Creating dashboard-ready rolling window views...")
+
+# Latest month analysis (most recent rolling window)
+latest_month = spark.sql("SELECT MAX(current_month) as max_month FROM rolling_presence_distribution").collect()[0]['max_month']
+
+print(f"Latest analysis month: {latest_month}")
+
+# Dashboard view for latest month
+latest_rolling_dashboard = spark.sql(f"""
+SELECT 
+    rp.naics3,
+    COALESCE(n.naics3_description, 'Unknown') as naics3_description,
+    rp.current_month,
+    rp.months_0,
+    rp.months_1_4,
+    rp.months_5_8,
+    rp.months_9_12,
+    rp.months_13,
+    rp.months_14_plus,
+    rp.total_merchants,
+    rs.total_sales_all,
+    rs.sales_months_14_plus,
+    rs.pct_sales_months_14_plus,
+    rt.total_txn_all,
+    rt.txn_months_14_plus,
+    rt.pct_txn_months_14_plus,
+    rc.merchants_13_or_less,
+    rc.merchants_14_plus,
+    rc.pct_merchants_13_or_less,
+    rc.pct_merchants_14_plus
+FROM rolling_presence_distribution rp
+LEFT JOIN (SELECT DISTINCT naics3, naics3_description FROM all_merchants) n ON rp.naics3 = n.naics3
+LEFT JOIN rolling_sales_with_pct rs ON rp.current_month = rs.current_month AND rp.naics3 = rs.naics3
+LEFT JOIN rolling_txn_with_pct rt ON rp.current_month = rt.current_month AND rp.naics3 = rt.naics3
+LEFT JOIN rolling_simplified_comparison rc ON rp.current_month = rc.current_month AND rp.naics3 = rc.naics3
+WHERE rp.current_month = '{latest_month}' AND rp.total_merchants > 50
+ORDER BY rp.total_merchants DESC
+""")
+
+latest_rolling_dashboard.createOrReplaceTempView("latest_rolling_dashboard")
+
+print(f"\nLatest rolling window dashboard for {latest_month}:")
+latest_rolling_dashboard.show(15)
+
+print("""
+Rolling 14-Month Window Analysis Complete!
+
+Key Views Created:
+1. rolling_merchant_presence - Individual merchant presence in each rolling window
+2. rolling_presence_distribution - Merchant count distribution by month and NAICS
+3. rolling_sales_with_pct - Sales distribution by month and NAICS
+4. rolling_txn_with_pct - Transaction distribution by month and NAICS
+5. rolling_simplified_comparison - Simplified ≤13 vs ≥14 comparison
+6. latest_rolling_dashboard - Dashboard-ready view for latest month
+
+Now each month shows merchant presence in the preceding 14-month window!
+""")
+
+# COMMAND ----------
